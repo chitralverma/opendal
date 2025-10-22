@@ -17,6 +17,35 @@
 
 # ruff: noqa: D104
 
-from opendal._opendal import *  # noqa: F403
+from importlib.metadata import version
 
-__all__ = [_opendal.__all__]  # noqa: F405
+from opendal._opendal import (
+    AsyncOperator,
+    ListOptions,
+    Operator,
+    ReadOptions,
+    StatOptions,
+    WriteOptions,
+    capability,
+    exceptions,
+    file,
+    layers,
+    types,
+)
+
+__version__ = version("opendal")
+
+__all__ = [
+    "AsyncOperator",
+    "ListOptions",
+    "Operator",
+    "ReadOptions",
+    "StatOptions",
+    "WriteOptions",
+    "__version__",
+    "capability",
+    "exceptions",
+    "file",
+    "layers",
+    "types",
+]
