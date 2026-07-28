@@ -182,7 +182,21 @@ jobs:
           ls -la "$SFTP_DIR"
           test -s "$SFTP_DIR/host_key" || { echo "host key was not generated"; exit 1; }
 
+          # Give the suite a dedicated root. Without one the tests operate on
+          # the runner's home directory, and the recursive listing cases walk
+          # the whole cargo registry, which is what pushed macOS past the
+          # harness timeout.
+          mkdir -p "$HOME/sftp-root"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # Windows OpenSSH exposes drive-qualified paths as /C:/...
+            SFTP_ROOT="/$(cygpath -m "$HOME/sftp-root")/"
+          else
+            SFTP_ROOT="$HOME/sftp-root/"
+          fi
+          echo "using root: $SFTP_ROOT"
+
           echo "OPENDAL_SFTP_KEY=$SFTP_DIR/client_key" >> "$GITHUB_ENV"
+          echo "OPENDAL_SFTP_ROOT=$SFTP_ROOT" >> "$GITHUB_ENV"
           echo "SFTP_CI_DIR=$SFTP_DIR" >> "$GITHUB_ENV"
 
       - name: Start sshd (unix)
@@ -236,7 +250,10 @@ jobs:
 
           "OPENDAL_SFTP_USER=$env:USERNAME" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Wait for sshd
+      # Git Bash builds bash without net redirections, so /dev/tcp silently
+      # fails on Windows even when sshd is listening.
+      - name: Wait for sshd (unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           for i in $(seq 1 30); do
@@ -249,6 +266,28 @@ jobs:
           echo "sshd did not come up"
           exit 1
 
+      - name: Wait for sshd (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          for ($i = 0; $i -lt 30; $i++) {
+            $c = New-Object System.Net.Sockets.TcpClient
+            try {
+              $c.Connect('127.0.0.1', 2222)
+              if ($c.Connected) {
+                Write-Host 'sshd is accepting connections'
+                $c.Close()
+                exit 0
+              }
+            } catch {
+              Start-Sleep -Seconds 1
+            } finally {
+              $c.Dispose()
+            }
+          }
+          Write-Host 'sshd did not come up'
+          exit 1
+
       - name: Behavior tests
         working-directory: core
         shell: bash
@@ -256,7 +295,6 @@ jobs:
           OPENDAL_TEST: sftp
           OPENDAL_SFTP_ENDPOINT: ssh://127.0.0.1:2222
           OPENDAL_SFTP_KNOWN_HOSTS_STRATEGY: accept
-          OPENDAL_DISABLE_RANDOM_ROOT: "true"
         run: |
           # Each test builds its own operator and therefore its own connection
           # pool. Hosted macOS runners fork processes slowly enough that a full
