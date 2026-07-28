@@ -117,36 +117,47 @@ jobs:
           cp "$SFTP_DIR/client_key.pub" "$SFTP_DIR/authorized_keys"
           chmod 600 "$SFTP_DIR/authorized_keys" "$SFTP_DIR/client_key" "$SFTP_DIR/host_key"
 
-          # Locate sftp-server without `ls`, whose non-zero exit on a missing
-          # path trips `set -e` under `pipefail`.
-          SFTP_SERVER=""
-          for candidate in \
-            /usr/lib/openssh/sftp-server \
-            /usr/libexec/openssh/sftp-server \
-            /usr/libexec/sftp-server \
-            /usr/lib/ssh/sftp-server \
-            "/c/Windows/System32/OpenSSH/sftp-server.exe"
-          do
-            if [ -x "$candidate" ]; then
-              SFTP_SERVER="$candidate"
-              break
-            fi
-          done
-          if [ -z "$SFTP_SERVER" ]; then
-            echo "could not locate sftp-server"
-            exit 1
-          fi
-
-          # sshd wants native paths; Git Bash paths are not understood.
           if [ "$RUNNER_OS" = "Windows" ]; then
+            # Must be the Windows OpenSSH sftp-server. Git Bash also ships one
+            # under "C:/Program Files/Git", and that path contains a space that
+            # the Subsystem directive cannot parse.
+            echo "--- C:/Windows/System32/OpenSSH ---"
+            ls -la "/c/Windows/System32/OpenSSH/" || true
+            SFTP_SERVER="/c/Windows/System32/OpenSSH/sftp-server.exe"
             CFG_DIR=$(cygpath -m "$SFTP_DIR")
-            SFTP_SERVER=$(cygpath -m "$SFTP_SERVER")
             EXTRA=""
           else
+            # Locate sftp-server without `ls`, whose non-zero exit on a missing
+            # path trips `set -e` under `pipefail`.
+            SFTP_SERVER=""
+            for candidate in \
+              /usr/lib/openssh/sftp-server \
+              /usr/libexec/openssh/sftp-server \
+              /usr/libexec/sftp-server \
+              /usr/lib/ssh/sftp-server
+            do
+              if [ -x "$candidate" ]; then
+                SFTP_SERVER="$candidate"
+                break
+              fi
+            done
             CFG_DIR="$SFTP_DIR"
             EXTRA="UsePAM no"
           fi
 
+          if [ ! -x "$SFTP_SERVER" ]; then
+            echo "could not locate sftp-server at: $SFTP_SERVER"
+            exit 1
+          fi
+          echo "using sftp-server: $SFTP_SERVER"
+
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            SFTP_SERVER=$(cygpath -m "$SFTP_SERVER")
+          fi
+
+          # UseDNS triggers a reverse lookup per connection, which adds seconds
+          # per handshake on the hosted runners. MaxStartups is raised so the
+          # pool can warm up without the server dropping handshakes.
           cat > "$SFTP_DIR/sshd_config" <<EOF
           Port 2222
           ListenAddress 127.0.0.1
@@ -155,9 +166,14 @@ jobs:
           PasswordAuthentication no
           KbdInteractiveAuthentication no
           StrictModes no
+          UseDNS no
+          GSSAPIAuthentication no
+          MaxStartups 100:30:200
+          MaxSessions 100
+          PidFile $CFG_DIR/sshd.pid
           LogLevel VERBOSE
           $EXTRA
-          Subsystem sftp $SFTP_SERVER
+          Subsystem sftp "$SFTP_SERVER"
           EOF
 
           echo "--- sshd_config ---"
