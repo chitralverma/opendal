@@ -97,12 +97,14 @@ jobs:
         with:
           workspaces: core
 
-      - name: Start OpenSSH server (unix)
-        if: runner.os != 'Windows'
+      # Keys and sshd_config are generated in bash on every platform, including
+      # Windows via Git Bash, so quoting rules stay uniform.
+      - name: Generate keys and sshd_config
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           SFTP_DIR="$HOME/sftp-ci"
+          rm -rf "$SFTP_DIR"
           mkdir -p "$SFTP_DIR"
 
           if [ "$RUNNER_OS" = "Linux" ]; then
@@ -115,79 +117,98 @@ jobs:
           cp "$SFTP_DIR/client_key.pub" "$SFTP_DIR/authorized_keys"
           chmod 600 "$SFTP_DIR/authorized_keys" "$SFTP_DIR/client_key" "$SFTP_DIR/host_key"
 
-          SFTP_SERVER=$(ls /usr/lib/openssh/sftp-server \
-                           /usr/libexec/openssh/sftp-server \
-                           /usr/libexec/sftp-server 2>/dev/null | head -1)
-          echo "using sftp-server: $SFTP_SERVER"
+          # Locate sftp-server without `ls`, whose non-zero exit on a missing
+          # path trips `set -e` under `pipefail`.
+          SFTP_SERVER=""
+          for candidate in \
+            /usr/lib/openssh/sftp-server \
+            /usr/libexec/openssh/sftp-server \
+            /usr/libexec/sftp-server \
+            /usr/lib/ssh/sftp-server \
+            "/c/Windows/System32/OpenSSH/sftp-server.exe"
+          do
+            if [ -x "$candidate" ]; then
+              SFTP_SERVER="$candidate"
+              break
+            fi
+          done
+          if [ -z "$SFTP_SERVER" ]; then
+            echo "could not locate sftp-server"
+            exit 1
+          fi
+
+          # sshd wants native paths; Git Bash paths are not understood.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            CFG_DIR=$(cygpath -m "$SFTP_DIR")
+            SFTP_SERVER=$(cygpath -m "$SFTP_SERVER")
+            EXTRA=""
+          else
+            CFG_DIR="$SFTP_DIR"
+            EXTRA="UsePAM no"
+          fi
 
           cat > "$SFTP_DIR/sshd_config" <<EOF
           Port 2222
           ListenAddress 127.0.0.1
-          HostKey $SFTP_DIR/host_key
-          AuthorizedKeysFile $SFTP_DIR/authorized_keys
+          HostKey $CFG_DIR/host_key
+          AuthorizedKeysFile $CFG_DIR/authorized_keys
           PasswordAuthentication no
           KbdInteractiveAuthentication no
-          UsePAM no
           StrictModes no
-          PidFile $SFTP_DIR/sshd.pid
           LogLevel VERBOSE
+          $EXTRA
           Subsystem sftp $SFTP_SERVER
           EOF
 
-          # Run unprivileged: sshd only ever authenticates the runner user.
-          $(command -v sshd || echo /usr/sbin/sshd) -f "$SFTP_DIR/sshd_config" -E "$SFTP_DIR/sshd.log"
+          echo "--- sshd_config ---"
+          cat "$SFTP_DIR/sshd_config"
+          echo "--- key files ---"
+          ls -la "$SFTP_DIR"
+          test -s "$SFTP_DIR/host_key" || { echo "host key was not generated"; exit 1; }
 
           echo "OPENDAL_SFTP_KEY=$SFTP_DIR/client_key" >> "$GITHUB_ENV"
+          echo "SFTP_CI_DIR=$SFTP_DIR" >> "$GITHUB_ENV"
+
+      - name: Start sshd (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Unprivileged: sshd only ever authenticates the runner user.
+          "$(command -v sshd || echo /usr/sbin/sshd)" \
+            -f "$SFTP_CI_DIR/sshd_config" -E "$SFTP_CI_DIR/sshd.log"
           echo "OPENDAL_SFTP_USER=$(whoami)" >> "$GITHUB_ENV"
 
-      - name: Start OpenSSH server (windows)
+      - name: Start sshd (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $SftpDir = Join-Path $env:USERPROFILE 'sftp-ci'
-          New-Item -ItemType Directory -Force -Path $SftpDir | Out-Null
 
           if (-not (Get-Command sshd.exe -ErrorAction SilentlyContinue)) {
             Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
           }
           $Sshd = (Get-Command sshd.exe).Source
-          $SftpServer = Join-Path (Split-Path $Sshd) 'sftp-server.exe'
           Write-Host "sshd: $Sshd"
-          Write-Host "sftp-server: $SftpServer"
 
-          ssh-keygen -q -t ed25519 -f "$SftpDir\host_key" -N '""'
-          ssh-keygen -q -t ed25519 -f "$SftpDir\client_key" -N '""'
-          Copy-Item "$SftpDir\client_key.pub" "$SftpDir\authorized_keys"
-
-          # sshd refuses key files that other principals can read.
+          # sshd rejects key files that other principals can read.
           foreach ($f in @('host_key', 'authorized_keys')) {
             $p = Join-Path $SftpDir $f
-            icacls $p /inheritance:r | Out-Null
-            icacls $p /grant:r "$($env:USERNAME):(R,W)" | Out-Null
-            icacls $p /grant:r "SYSTEM:(R,W)" | Out-Null
+            icacls $p /inheritance:r /grant:r "$($env:USERNAME):(F)" /grant:r "SYSTEM:(F)" /grant:r "Administrators:(F)"
           }
 
-          # Forward slashes: sshd_config treats backslash as an escape.
           $Cfg = $SftpDir.Replace('\', '/')
-          @"
-          Port 2222
-          ListenAddress 127.0.0.1
-          HostKey $Cfg/host_key
-          AuthorizedKeysFile $Cfg/authorized_keys
-          PasswordAuthentication no
-          KbdInteractiveAuthentication no
-          StrictModes no
-          LogLevel VERBOSE
-          Subsystem sftp $($SftpServer.Replace('\', '/'))
-          "@ | Set-Content -Path "$SftpDir\sshd_config" -Encoding ascii
-
           Start-Process -FilePath $Sshd `
             -ArgumentList @('-f', "$Cfg/sshd_config", '-E', "$Cfg/sshd.log") `
             -NoNewWindow
-          Start-Sleep -Seconds 3
+          Start-Sleep -Seconds 5
 
-          "OPENDAL_SFTP_KEY=$($SftpDir.Replace('\','/'))/client_key" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if (Test-Path "$SftpDir\sshd.log") {
+            Write-Host "--- sshd.log ---"
+            Get-Content "$SftpDir\sshd.log"
+          }
+
           "OPENDAL_SFTP_USER=$env:USERNAME" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Wait for sshd
@@ -216,7 +237,11 @@ jobs:
       - name: sshd log on failure
         if: failure()
         shell: bash
-        run: cat "$HOME/sftp-ci/sshd.log" 2>/dev/null || true
+        run: |
+          echo "--- sshd.log ---"
+          cat "$HOME/sftp-ci/sshd.log" 2>/dev/null || echo "(no log)"
+          echo "--- dir ---"
+          ls -la "$HOME/sftp-ci" 2>/dev/null || true
 
   # Mirrors the upstream Linux setup: dockerised atmoz/sftp with an absolute
   # OPENDAL_SFTP_ROOT, covering the rooted path handling the matrix above skips.
