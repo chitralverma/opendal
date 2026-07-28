@@ -1,0 +1,304 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# TEMPORARY. Validates the russh port of services/sftp on Linux, macOS, and
+# Windows. Upstream behavior tests need 1Password-backed credentials, so this
+# stands up its own OpenSSH server on each runner instead. Delete before merge.
+
+name: tmp sftp cross-platform
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ci/sftp-crossplatform
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Lint, unit tests, and doc tests. Proves the crate compiles on Windows,
+  # which the openssh-based implementation could not do at all.
+  check:
+    name: check / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Rust
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      - name: Build
+        working-directory: core
+        run: cargo build -p opendal-service-sftp --locked
+
+      - name: Clippy
+        working-directory: core
+        run: cargo clippy -p opendal-service-sftp --all-targets --locked -- -D warnings
+
+      - name: Rustfmt
+        working-directory: core
+        run: cargo fmt --all -- --check
+
+      - name: Unit tests
+        working-directory: core
+        run: cargo test -p opendal-service-sftp --lib --locked
+
+      - name: Doc tests
+        working-directory: core
+        run: cargo test -p opendal-service-sftp --doc --locked
+
+  # Full 118-case behavior suite against a real OpenSSH server.
+  #
+  # Paths stay relative to the login directory (no OPENDAL_SFTP_ROOT) so the
+  # same configuration works on all three platforms; Windows OpenSSH exposes
+  # drive-qualified roots like /C:/Users/runneradmin, which an absolute root
+  # would have to special-case.
+  behavior:
+    name: behavior / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      - name: Start OpenSSH server (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          SFTP_DIR="$HOME/sftp-ci"
+          mkdir -p "$SFTP_DIR"
+
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq openssh-server
+          fi
+
+          ssh-keygen -q -t ed25519 -f "$SFTP_DIR/host_key" -N ''
+          ssh-keygen -q -t ed25519 -f "$SFTP_DIR/client_key" -N ''
+          cp "$SFTP_DIR/client_key.pub" "$SFTP_DIR/authorized_keys"
+          chmod 600 "$SFTP_DIR/authorized_keys" "$SFTP_DIR/client_key" "$SFTP_DIR/host_key"
+
+          SFTP_SERVER=$(ls /usr/lib/openssh/sftp-server \
+                           /usr/libexec/openssh/sftp-server \
+                           /usr/libexec/sftp-server 2>/dev/null | head -1)
+          echo "using sftp-server: $SFTP_SERVER"
+
+          cat > "$SFTP_DIR/sshd_config" <<EOF
+          Port 2222
+          ListenAddress 127.0.0.1
+          HostKey $SFTP_DIR/host_key
+          AuthorizedKeysFile $SFTP_DIR/authorized_keys
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          UsePAM no
+          StrictModes no
+          PidFile $SFTP_DIR/sshd.pid
+          LogLevel VERBOSE
+          Subsystem sftp $SFTP_SERVER
+          EOF
+
+          # Run unprivileged: sshd only ever authenticates the runner user.
+          $(command -v sshd || echo /usr/sbin/sshd) -f "$SFTP_DIR/sshd_config" -E "$SFTP_DIR/sshd.log"
+
+          echo "OPENDAL_SFTP_KEY=$SFTP_DIR/client_key" >> "$GITHUB_ENV"
+          echo "OPENDAL_SFTP_USER=$(whoami)" >> "$GITHUB_ENV"
+
+      - name: Start OpenSSH server (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $SftpDir = Join-Path $env:USERPROFILE 'sftp-ci'
+          New-Item -ItemType Directory -Force -Path $SftpDir | Out-Null
+
+          if (-not (Get-Command sshd.exe -ErrorAction SilentlyContinue)) {
+            Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+          }
+          $Sshd = (Get-Command sshd.exe).Source
+          $SftpServer = Join-Path (Split-Path $Sshd) 'sftp-server.exe'
+          Write-Host "sshd: $Sshd"
+          Write-Host "sftp-server: $SftpServer"
+
+          ssh-keygen -q -t ed25519 -f "$SftpDir\host_key" -N '""'
+          ssh-keygen -q -t ed25519 -f "$SftpDir\client_key" -N '""'
+          Copy-Item "$SftpDir\client_key.pub" "$SftpDir\authorized_keys"
+
+          # sshd refuses key files that other principals can read.
+          foreach ($f in @('host_key', 'authorized_keys')) {
+            $p = Join-Path $SftpDir $f
+            icacls $p /inheritance:r | Out-Null
+            icacls $p /grant:r "$($env:USERNAME):(R,W)" | Out-Null
+            icacls $p /grant:r "SYSTEM:(R,W)" | Out-Null
+          }
+
+          # Forward slashes: sshd_config treats backslash as an escape.
+          $Cfg = $SftpDir.Replace('\', '/')
+          @"
+          Port 2222
+          ListenAddress 127.0.0.1
+          HostKey $Cfg/host_key
+          AuthorizedKeysFile $Cfg/authorized_keys
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          StrictModes no
+          LogLevel VERBOSE
+          Subsystem sftp $($SftpServer.Replace('\', '/'))
+          "@ | Set-Content -Path "$SftpDir\sshd_config" -Encoding ascii
+
+          Start-Process -FilePath $Sshd `
+            -ArgumentList @('-f', "$Cfg/sshd_config", '-E', "$Cfg/sshd.log") `
+            -NoNewWindow
+          Start-Sleep -Seconds 3
+
+          "OPENDAL_SFTP_KEY=$($SftpDir.Replace('\','/'))/client_key" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "OPENDAL_SFTP_USER=$env:USERNAME" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Wait for sshd
+        shell: bash
+        run: |
+          for i in $(seq 1 30); do
+            if bash -c 'exec 3<>/dev/tcp/127.0.0.1/2222' 2>/dev/null; then
+              echo "sshd is accepting connections"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "sshd did not come up"
+          exit 1
+
+      - name: Behavior tests
+        working-directory: core
+        shell: bash
+        env:
+          OPENDAL_TEST: sftp
+          OPENDAL_SFTP_ENDPOINT: ssh://127.0.0.1:2222
+          OPENDAL_SFTP_KNOWN_HOSTS_STRATEGY: accept
+          OPENDAL_DISABLE_RANDOM_ROOT: "true"
+        run: cargo test behavior --features tests,services-sftp --locked
+
+      - name: sshd log on failure
+        if: failure()
+        shell: bash
+        run: cat "$HOME/sftp-ci/sshd.log" 2>/dev/null || true
+
+  # Mirrors the upstream Linux setup: dockerised atmoz/sftp with an absolute
+  # OPENDAL_SFTP_ROOT, covering the rooted path handling the matrix above skips.
+  behavior-rooted-linux:
+    name: behavior / rooted (docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      - name: Start SFTP
+        working-directory: fixtures/sftp
+        run: docker compose -f docker-compose-sftp.yml up -d --wait
+
+      - name: Behavior tests
+        working-directory: core
+        env:
+          OPENDAL_TEST: sftp
+          OPENDAL_SFTP_ENDPOINT: ssh://127.0.0.1:2222
+          OPENDAL_SFTP_ROOT: /upload/sftp_test/
+          OPENDAL_SFTP_USER: foo
+          OPENDAL_SFTP_KNOWN_HOSTS_STRATEGY: accept
+        run: |
+          chmod 600 "$GITHUB_WORKSPACE/fixtures/sftp/test_ssh_key"
+          export OPENDAL_SFTP_KEY="$GITHUB_WORKSPACE/fixtures/sftp/test_ssh_key"
+          cargo test behavior --features tests,services-sftp --locked
+
+  # Guards the known_hosts logic that replaced ssh's own implementation.
+  # Upstream CI only ever exercises `accept`.
+  known-hosts:
+    name: known_hosts strategies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      - name: Start SFTP
+        working-directory: fixtures/sftp
+        run: docker compose -f docker-compose-sftp.yml up -d --wait
+
+      - name: strict rejects, add records, strict then accepts
+        working-directory: core
+        run: |
+          set -euxo pipefail
+          chmod 600 "$GITHUB_WORKSPACE/fixtures/sftp/test_ssh_key"
+
+          cargo build --tests --features tests,services-sftp --locked
+          BIN=$(ls -t target/debug/deps/behavior-* | grep -v '\.d$' | head -1)
+
+          FAKE_HOME=$(mktemp -d)
+          run_case() {
+            HOME="$FAKE_HOME" \
+            OPENDAL_TEST=sftp \
+            OPENDAL_SFTP_ENDPOINT=ssh://127.0.0.1:2222 \
+            OPENDAL_SFTP_ROOT=/upload/sftp_test/ \
+            OPENDAL_SFTP_USER=foo \
+            OPENDAL_SFTP_KEY="$GITHUB_WORKSPACE/fixtures/sftp/test_ssh_key" \
+            OPENDAL_SFTP_KNOWN_HOSTS_STRATEGY="$1" \
+            "$BIN" test_stat_file --test-threads=1
+          }
+
+          echo "--- strict must fail against an empty known_hosts ---"
+          if run_case strict; then
+            echo "strict accepted an unknown host key"
+            exit 1
+          fi
+
+          echo "--- add must succeed and record the key ---"
+          run_case add
+          grep -q '127.0.0.1' "$FAKE_HOME/.ssh/known_hosts"
+
+          echo "--- strict must now succeed ---"
+          run_case strict
