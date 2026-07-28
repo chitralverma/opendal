@@ -209,44 +209,50 @@ jobs:
             -f "$SFTP_CI_DIR/sshd_config" -E "$SFTP_CI_DIR/sshd.log"
           echo "OPENDAL_SFTP_USER=$(whoami)" >> "$GITHUB_ENV"
 
+      # Run sshd as the Windows service rather than a child process: a process
+      # started from a step is torn down when that step's shell exits, which
+      # left the port closed by the time the next step ran.
       - name: Start sshd (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $SftpDir = Join-Path $env:USERPROFILE 'sftp-ci'
+          $SftpDir = (Join-Path $env:USERPROFILE 'sftp-ci').Replace('\', '/')
 
-          if (-not (Get-Command sshd.exe -ErrorAction SilentlyContinue)) {
+          if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
             Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
           }
-          $Sshd = (Get-Command sshd.exe).Source
-          Write-Host "sshd: $Sshd"
+          Stop-Service sshd -ErrorAction SilentlyContinue
 
-          # sshd rejects key files that other principals can read.
-          foreach ($f in @('host_key', 'authorized_keys')) {
-            $p = Join-Path $SftpDir $f
-            icacls $p /inheritance:r /grant:r "$($env:USERNAME):(F)" /grant:r "SYSTEM:(F)" /grant:r "Administrators:(F)"
-          }
+          # Host keys for the service live in ProgramData.
+          ssh-keygen -A
 
-          $Cfg = $SftpDir.Replace('\', '/')
-          Start-Process -FilePath $Sshd `
-            -ArgumentList @('-f', "$Cfg/sshd_config", '-E', "$Cfg/sshd.log") `
-            -NoNewWindow
-          Start-Sleep -Seconds 5
+          $SftpServer = 'C:/Windows/System32/OpenSSH/sftp-server.exe'
+          @"
+          Port 2222
+          ListenAddress 127.0.0.1
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          StrictModes no
+          UseDNS no
+          GSSAPIAuthentication no
+          MaxStartups 100:30:200
+          MaxSessions 100
+          LogLevel VERBOSE
+          AuthorizedKeysFile $SftpDir/authorized_keys
+          Subsystem sftp "$SftpServer"
+          "@ | Set-Content -Path 'C:\ProgramData\ssh\sshd_config' -Encoding ascii
 
-          # sshd keeps the log open, so a plain read fails with a sharing
-          # violation. Open it with shared access and never fail the step.
-          try {
-            $fs = [System.IO.File]::Open(
-              "$SftpDir\sshd.log", 'Open', 'Read',
-              [System.IO.FileShare]::ReadWrite)
-            $sr = New-Object System.IO.StreamReader($fs)
-            Write-Host "--- sshd.log ---"
-            Write-Host $sr.ReadToEnd()
-            $sr.Close(); $fs.Close()
-          } catch {
-            Write-Host "could not read sshd.log: $_"
-          }
+          Write-Host '--- sshd_config ---'
+          Get-Content 'C:\ProgramData\ssh\sshd_config'
+
+          # The default config restricts administrators to a shared key file;
+          # this run authenticates through AuthorizedKeysFile instead.
+          icacls "$SftpDir/authorized_keys" /inheritance:r /grant:r "$($env:USERNAME):(F)" /grant:r "SYSTEM:(F)" /grant:r "Administrators:(F)"
+
+          Set-Service sshd -StartupType Automatic
+          Start-Service sshd
+          (Get-Service sshd).Status
 
           "OPENDAL_SFTP_USER=$env:USERNAME" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
