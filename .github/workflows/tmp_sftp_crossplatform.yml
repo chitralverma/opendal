@@ -220,9 +220,18 @@ jobs:
             -NoNewWindow
           Start-Sleep -Seconds 5
 
-          if (Test-Path "$SftpDir\sshd.log") {
+          # sshd keeps the log open, so a plain read fails with a sharing
+          # violation. Open it with shared access and never fail the step.
+          try {
+            $fs = [System.IO.File]::Open(
+              "$SftpDir\sshd.log", 'Open', 'Read',
+              [System.IO.FileShare]::ReadWrite)
+            $sr = New-Object System.IO.StreamReader($fs)
             Write-Host "--- sshd.log ---"
-            Get-Content "$SftpDir\sshd.log"
+            Write-Host $sr.ReadToEnd()
+            $sr.Close(); $fs.Close()
+          } catch {
+            Write-Host "could not read sshd.log: $_"
           }
 
           "OPENDAL_SFTP_USER=$env:USERNAME" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -248,7 +257,17 @@ jobs:
           OPENDAL_SFTP_ENDPOINT: ssh://127.0.0.1:2222
           OPENDAL_SFTP_KNOWN_HOSTS_STRATEGY: accept
           OPENDAL_DISABLE_RANDOM_ROOT: "true"
-        run: cargo test behavior --features tests,services-sftp --locked
+        run: |
+          # Each test builds its own operator and therefore its own connection
+          # pool. Hosted macOS runners fork processes slowly enough that a full
+          # parallel run pushes individual operations past the harness timeout,
+          # so cap the concurrency there.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            THREADS=4
+          else
+            THREADS=8
+          fi
+          cargo test behavior --features tests,services-sftp --locked -- --test-threads="$THREADS"
 
       - name: sshd log on failure
         if: failure()
